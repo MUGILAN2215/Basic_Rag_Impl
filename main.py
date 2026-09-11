@@ -1,7 +1,22 @@
+import os
+import json
+import time
+import re
 import PyPDF2
 from google import genai
 import faiss
 import numpy as np
+from google.genai import types
+
+# ---------- Config ----------
+INDEX_FILE = "my_index.faiss"
+CHUNKS_FILE = "chunks.json"
+PDF_FILE = "sample.pdf"
+EMBED_MODEL = "gemini-embedding-001"
+GEN_MODEL = "gemini-2.5-flash"
+TOP_K = 3  # can lower back to 3 now, since chunks are cleaner
+
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
 
 # ---------- Phase 1: Load PDF ----------
 def load_pdf(path):
@@ -12,82 +27,79 @@ def load_pdf(path):
             text += page.extract_text() + "\n"
     return text
 
-doc_text = load_pdf("sample.pdf")
+# ---------- Phase 2: Chunking (section-based, fixes the root cause) ----------
+def chunk_by_sections(text):
+    sections = re.split(r'\n(?=[A-Z][A-Z\s&]{3,}\n)', text)
+    return [s.strip() for s in sections if s.strip()]
 
-# ---------- Phase 2: Chunking ----------
-def chunk_text(text, chunk_size=500, overlap=50):
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start += chunk_size - overlap
-    return chunks
+# ---------- Phase 3: Embeddings (with retry) ----------
+def get_embedding(text, retries=3):
+    for attempt in range(retries):
+        try:
+            result = client.models.embed_content(model=EMBED_MODEL, contents=text)
+            return result.embeddings[0].values
+        except Exception as e:
+            print(f"Embedding attempt {attempt+1} failed: {e}")
+            time.sleep(2)
+    raise Exception("Embedding failed after retries")
 
-chunks = chunk_text(doc_text)
-print(f"Total chunks created: {len(chunks)}")
+# ---------- Phase 4: Build or Load Index ----------
+def build_index():
+    print("No saved index found — building fresh (this calls the API)...")
+    doc_text = load_pdf(PDF_FILE)
+    chunks = chunk_by_sections(doc_text)
 
-# ---------- Phase 3: Embeddings ----------
-client = genai.Client(api_key=" ")  # paste your real key
+    print(f"Total chunks: {len(chunks)}")
+    for i, c in enumerate(chunks):
+        print(f"\n[Chunk {i}] {c[:80]}...")
 
-def get_embedding(text):
-    result = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=text
-    )
-    return result.embeddings[0].values
+    all_embeddings = [get_embedding(c) for c in chunks]
 
-all_embeddings = []
-for chunk in chunks:
-    vec = get_embedding(chunk)
-    all_embeddings.append(vec)
+    dimension = len(all_embeddings[0])
+    index = faiss.IndexFlatL2(dimension)
+    embeddings_array = np.array(all_embeddings).astype('float32')
+    index.add(embeddings_array)
 
-print(f"Total embeddings created: {len(all_embeddings)}")
-print(f"Each vector length: {len(all_embeddings[0])}")
+    chunk_lookup = {i: chunks[i] for i in range(len(chunks))}
 
-# ---------- Phase 4: Vector Store (FAISS) ----------
-dimension = len(all_embeddings[0])
-index = faiss.IndexFlatL2(dimension)
+    faiss.write_index(index, INDEX_FILE)
+    with open(CHUNKS_FILE, "w") as f:
+        json.dump(chunk_lookup, f)
 
-embeddings_array = np.array(all_embeddings).astype('float32')
-index.add(embeddings_array)
+    print(f"\nIndex built and saved: {index.ntotal} vectors.")
+    return index, chunk_lookup
 
-print(f"Total vectors stored in FAISS: {index.ntotal}")
+def load_index():
+    print("Saved index found — loading from disk (no API calls needed).")
+    index = faiss.read_index(INDEX_FILE)
+    with open(CHUNKS_FILE, "r") as f:
+        raw_lookup = json.load(f)
+    chunk_lookup = {int(k): v for k, v in raw_lookup.items()}
+    return index, chunk_lookup
 
-# mapping: FAISS position -> original text chunk
-chunk_lookup = {i: chunks[i] for i in range(len(chunks))}
+def get_index():
+    if os.path.exists(INDEX_FILE) and os.path.exists(CHUNKS_FILE):
+        return load_index()
+    else:
+        return build_index()
+
+index, chunk_lookup = get_index()
 
 # ---------- Phase 5: Retrieval ----------
-def get_query_embedding(text):
-    result = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=text
-    )
-    return result.embeddings[0].values
-
-def retrieve(question, top_k=3):
-    query_vector = get_query_embedding(question)
+def retrieve(question, top_k=TOP_K):
+    query_vector = get_embedding(question)
     query_array = np.array([query_vector]).astype('float32')
-
     distances, indices = index.search(query_array, top_k)
-
-    retrieved_chunks = [chunk_lookup[i] for i in indices[0]]
-    return retrieved_chunks
-
-# test it
-question = "What are tools did he Know to use?"
-results = retrieve(question)
-
-for i, chunk in enumerate(results):
-    print(f"\n--- Match {i+1} ---")
-    print(chunk)
+    return [chunk_lookup[i] for i in indices[0]]
 
 # ---------- Phase 6: Generation ----------
-def generate_answer(question, retrieved_chunks):
+def generate_answer(question, retrieved_chunks, retries=3):
+    print("\n--- RETRIEVED CHUNKS (debug) ---")
+    for i, chunk in enumerate(retrieved_chunks):
+        print(f"[{i}] {chunk[:100]}...")
+
     context = "\n\n".join(retrieved_chunks)
-    
-    prompt = f"""Answer the question using ONLY the context below. 
+    prompt = f"""Answer the question using ONLY the context below.
 If the answer isn't in the context, say "I don't have that information."
 
 Context:
@@ -97,13 +109,23 @@ Question: {question}
 
 Answer:"""
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
-    return response.text
+    for attempt in range(retries):
+        try:
+            response = client.models.generate_content(
+                model=GEN_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0, tools=[])
+            )
+            return response.text
+        except Exception as e:
+            print(f"Generation attempt {attempt+1} failed: {e}")
+            time.sleep(2)
+    raise Exception("Generation failed after retries")
 
-# test it
-answer = generate_answer(question, results)
-print("\n--- FINAL ANSWER ---")
-print(answer)
+# ---------- Run ----------
+if __name__ == "__main__":
+    question = "What does Mugilan done in prep room project"
+    results = retrieve(question)
+    answer = generate_answer(question, results)
+    print("\n--- FINAL ANSWER ---")
+    print(answer)
